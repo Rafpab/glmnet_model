@@ -1,0 +1,348 @@
+library(tidyverse)
+library(janitor)
+library(readxl)
+library(lubridate)
+library(DMwR)
+library(caret)
+library(fastDummies)
+library(hrbrthemes)
+library(viridis)
+library(dplyr)
+library(ggplot2)
+library(tidymodels)
+library(parameters)
+library(themis)
+library(glmnet)
+
+full_winback_sample <- clean_names(read.csv("G:/SASData/Marketing/CRM/Github/Others/outputs/winback_sample.csv"))
+view_contract <- clean_names(read.csv("G:/SASData/Marketing/CRM/Github/c2dp-segmentation/sources/views_contract.csv",sep=",",encoding = "UTF-8"))
+view_customer <- clean_names(read.csv("G:/SASData/Marketing/CRM/Github/c2dp-segmentation/sources/views_customer.csv",sep=",",encoding = "UTF-8"))
+raw_tipo_plan <- read.csv("G:/SASData/Andres_Franco/AA_Insumos/AA_ULTIMAS_MINAS/tipo_plan_upd.csv") %>% select(promocion,tipo_plan)
+homologacion_familia <-  clean_names(read.csv("G:/SASData/Andres_Franco/AA_Insumos/AA_ULTIMAS_MINAS/Homologacion_Familia.csv",sep=";"))
+marketing <- clean_names(read.csv(unz("P:/MinaDesembolsos/RCI_DESEMBOLSOS_01.csv.zip", "RCI_DESEMBOLSOS_01.csv"), header=T, sep=";"))
+
+
+tasas_mensuales <- marketing %>% mutate(fecha_desembolso = as.Date(dmy(fecha_desembolso))) %>% 
+  group_by(year = year(fecha_desembolso),month = month(fecha_desembolso)) %>% 
+  summarise(tasa_promedio = mean(tasa_cliente)) %>% ungroup() %>%
+  mutate(key = paste(year,month,sep=""))
+
+full_winback_sample %>% count(winback)
+
+#I was not going to do this part, but, given the fact that hq has asked for specific parameters, i have 
+#decided to include intelligence on this topic in this script, it could be useful in the end.
+#REVIEW OF THE PARAMETERS USED BY HQ AND, AT THE SAME TIME, QUALITY ON OUR DATA
+
+view_contract_filter <- view_contract %>% mutate(scale_description = str_to_upper(str_squish(scale_description)),
+                                                 scale_description = gsub("(^\\(+)([0-9]+)([0-9]*)(\\) +)|^[A-Z] +|(^[A-Z] +)(\\(+)([0-9]+)([0-9]*)(\\) +)","",scale_description)) %>%
+  left_join(raw_tipo_plan,
+            by = c("scale_description"="promocion")) %>%
+  mutate(model_family = str_to_upper(str_squish(model_family))) %>%
+  left_join(homologacion_familia %>% mutate(familia_vehiculo = str_to_upper(str_squish(familia_vehiculo))) %>%
+              distinct(familia_vehiculo,.keep_all = TRUE), by = c("model_family" = "familia_vehiculo")) %>%
+  filter(tipo_plan != "Balloon") %>% mutate(contract_real_end_date = ymd(contract_real_end_date),
+                                            contract_start_date = ymd(contract_start_date),
+                                            contract_planned_end_date = ymd(contract_planned_end_date)) %>%
+  mutate(time_with_contract = contract_real_end_date-contract_start_date,
+         epo_days = contract_planned_end_date-contract_real_end_date, #is how many days the contract was early paid
+         financed_amount_perc = financed_amount/vehicle_price,
+         initial_fee = vehicle_price - financed_amount)
+
+view_customer_filter <- view_customer %>% filter(account_status == "C") %>%
+  mutate(accommodation_type = gsub("^$",NA,accommodation_type),
+         marital_status = gsub("^$",NA,marital_status),
+         marital_status = gsub("CASADO POR BIENES MANCOMUNADOS","CASADO",marital_status),
+         marital_status = gsub("CASADO POR BIENES SEPARADOS","CASADO",marital_status),
+         marital_status = gsub("SEPARADO","DIVORCIADO",marital_status)) %>%
+  distinct(local_sys_customer_id,.keep_all = TRUE) %>% 
+  filter(accommodation_type != "Otros",gender != "SIN DATOS") %>%
+  mutate(city = gsub("^$",NA,city)) %>% drop_na(age)
+
+full_winback_demo_var <- full_winback_sample %>% mutate(contract_number = as.numeric(contract_number)) %>%
+  left_join(select(view_customer_filter,c(local_sys_customer_id,accommodation_type,gender,
+                                          marital_status,total_income,city,age)),
+            by= "local_sys_customer_id") %>%
+  left_join(select(view_contract_filter,c(contract_number,tipo_plan,scale_description,
+                                          homologacion,time_with_contract,
+                                          epo_days,financed_amount_perc,initial_fee)),
+            by= "contract_number") %>% mutate(contract_start_date = as.Date(contract_start_date),
+                                              year_disbursement = as.factor(year(contract_start_date))) %>%
+  mutate(new_contract_number = case_when(harvest_time_months_old1 > 12 & winback == "yes" ~ as.character(new_contr_number_1),
+                                             harvest_time_months_old1 <= 12 & harvest_time_months_old2 > 12 & winback == "yes" ~ as.character(new_contr_number_2),
+                                             TRUE ~ "NA"),
+         key_tasas = paste(year(contract_start_date),month(contract_start_date),sep="")) %>%
+  left_join(select(marketing %>%
+                     mutate(prestamo = as.character(prestamo)), 
+                   c(prestamo,tasa_cliente)), by = c("new_contract_number" = "prestamo")) %>%
+  left_join(select(tasas_mensuales,c(key, tasa_promedio)), by = c("key_tasas" = "key")) %>%
+  mutate(tasa_cliente = case_when(is.na(tasa_cliente) == TRUE ~ tasa_promedio,
+                                  TRUE ~ tasa_cliente))
+  
+
+full_winback_demo_var <- full_winback_demo_var %>% drop_na(city) %>%
+  left_join(select(full_winback_demo_var %>% drop_na(city) %>% count(city,name="total_customers") %>% 
+                     mutate(city_final = case_when(total_customers >= 1000 ~ city,
+                                                   TRUE ~ "OTHERS")),
+                   c(city_final,city)),by="city") %>%
+  drop_na(homologacion) %>%
+  left_join(select(full_winback_demo_var %>% drop_na(homologacion) %>% count(homologacion,name="total_customers") %>%  
+                     mutate(homologacion_final = case_when(total_customers >= 2000 ~ homologacion,
+                                                           TRUE ~ "OTHERS")),
+                   c(homologacion_final,homologacion)),by="homologacion") %>%
+  mutate(current_age = age + (year(today())-year(contract_start_date))) %>% mutate(age = as.numeric(age),
+                                                                                   current_age = as.numeric(current_age)) %>% 
+  mutate(age_final = case_when(winback=="yes"~age, TRUE~current_age)) %>%
+  
+  mutate(total_income = case_when(year(contract_start_date) == 2017 ~ total_income * 1.0409 * 1.0318 * 1.038 * 1.016 * 1.056,
+                                  year(contract_start_date) == 2018 ~ total_income * 1.0318 * 1.038 * 1.016 * 1.056,
+                                  year(contract_start_date) == 2019 ~ total_income * 1.038 * 1.016 * 1.056,
+                                  year(contract_start_date) == 2020 ~ total_income * 1.016 * 1.056,
+                                  year(contract_start_date) == 2021 ~ total_income * 1.056,
+                                  TRUE ~ total_income),
+         vehicle_price = case_when(year(contract_start_date) == 2017 ~ vehicle_price * 1.0409 * 1.0318 * 1.038 * 1.016 * 1.056,
+                                  year(contract_start_date) == 2018 ~ vehicle_price * 1.0318 * 1.038 * 1.016 * 1.056,
+                                  year(contract_start_date) == 2019 ~ vehicle_price * 1.038 * 1.016 * 1.056,
+                                  year(contract_start_date) == 2020 ~ vehicle_price * 1.016 * 1.056,
+                                  year(contract_start_date) == 2021 ~ vehicle_price * 1.056,
+                                  TRUE ~ vehicle_price),
+         initial_fee = case_when(year(contract_start_date) == 2017 ~ initial_fee * 1.0409 * 1.0318 * 1.038 * 1.016 * 1.056,
+                                   year(contract_start_date) == 2018 ~ initial_fee * 1.0318 * 1.038 * 1.016 * 1.056,
+                                   year(contract_start_date) == 2019 ~ initial_fee * 1.038 * 1.016 * 1.056,
+                                   year(contract_start_date) == 2020 ~ initial_fee * 1.016 * 1.056,
+                                   year(contract_start_date) == 2021 ~ initial_fee * 1.056,
+                                   TRUE ~ initial_fee))
+
+
+#lets bring to present values everything
+
+
+
+#exploratory model
+
+#here we are preparing the database
+
+winback_variables <- full_winback_demo_var %>% mutate(contract_real_end_date = ymd(contract_real_end_date)) %>%
+  mutate(harvest_time_old_1 = as.numeric(replace_na(harvest_time_old_1,0))) %>% 
+  mutate(harvest_time_old_2 = as.numeric(replace_na(harvest_time_old_2,0))) %>%
+  mutate(harvest_time_old_1 = case_when(harvest_time_old_1 < 0 ~ 0,
+                                        TRUE ~ harvest_time_old_1)) %>%
+  mutate(harvest_time_old_2 = case_when(harvest_time_old_2 < 0 ~ 0,
+                                        TRUE ~ harvest_time_old_2)) %>%
+  mutate(harvest_days = case_when(harvest_time_old_1 == 0 & harvest_time_old_2  == 0 ~ today()-contract_real_end_date,
+                                  harvest_time_old_1 < harvest_time_old_2 ~ harvest_time_old_2,
+                                  TRUE ~ harvest_time_old_1)) %>% 
+  mutate(harvest_days = as.numeric(harvest_days)) %>%
+  drop_na(accommodation_type,gender,
+          marital_status,total_income,harvest_days,tipo_plan,
+          year_disbursement,city_final,homologacion_final,age_final,time_with_contract,
+          contract_duration,epo_days,vehicle_price,financed_amount_perc,
+          tasa_cliente,initial_fee) %>%
+  filter(total_income < (mean(total_income)+(sd(total_income)*3))) %>%
+  filter(total_income > (mean(total_income)-(sd(total_income)*1.2))) %>%
+  select(winback,accommodation_type,gender,
+         marital_status,total_income,harvest_days,tipo_plan,
+         year_disbursement,city_final,homologacion_final,
+         age_final,time_with_contract,
+         contract_duration,epo_days,vehicle_price,financed_amount_perc,
+         tasa_cliente,initial_fee) %>%
+  filter(accommodation_type != "Otros",gender != "SIN DATOS") %>%
+  dummy_cols(select_columns = c("accommodation_type",
+                                "marital_status","tipo_plan",
+                                "year_disbursement","city_final",
+                                "homologacion_final"),remove_selected_columns = TRUE) %>%
+  mutate(winback = gsub("yes","1",winback),
+         winback = gsub("no","0",winback), 
+         winback = as.factor(winback))
+
+
+numeric_columns <- c("total_income","harvest_days","age_final","time_with_contract",
+                     "contract_duration","epo_days","vehicle_price","financed_amount_perc",
+                     "tasa_cliente","initial_fee")
+
+factor_columns <- winback_variables %>% select(-numeric_columns) %>% colnames()
+
+winback_variables[factor_columns] <- lapply(winback_variables[factor_columns], factor)
+
+winback_variables[numeric_columns] <- lapply(winback_variables[numeric_columns], as.numeric)
+
+winback_variables[numeric_columns] <- lapply(winback_variables[numeric_columns], function(x) c(scale(x)))
+
+winback_variables %>% count(winback)
+
+list_of_smotes <- list()
+
+for (i in 1:5) {
+
+    smote.name <- paste("smote",i*2,sep="_")
+    list_of_smotes[[smote.name]] <- SMOTE(winback ~ ., winback_variables, perc.over = 1500,perc.under = (nrow(winback_variables[winback_variables$winback==0,])/
+                                                                                                         (nrow(winback_variables[winback_variables$winback==1,])*15)*100),#the first number has to change according to the amount of times you are increasing winbacks, the idea is to keep the real number of no winbacks
+                                        k=i*2)
+    
+  }
+  
+list_of_smotes$smote_2 %>% count(winback)
+
+#list_of_smotes %>% count(winback)
+
+
+for (i in 1:5) {
+  
+list_of_smotes[[i]] <-  list_of_smotes[[i]] %>% mutate(gender = case_when(gender == "FEMENINO" ~ 0,
+                                                    TRUE ~ 1))
+  
+}
+
+list_tomek_smoted <- list()
+
+for (i in 1:5) {
+
+  list_of_smotes[[i]][1:ncol(list_of_smotes[[i]])] <- lapply(list_of_smotes[[i]][1:ncol(list_of_smotes[[i]])], as.character)
+  list_of_smotes[[i]][1:ncol(list_of_smotes[[i]])] <- lapply(list_of_smotes[[i]][1:ncol(list_of_smotes[[i]])], as.numeric)
+  list_of_smotes[[i]][,"winback"] <- as.factor(list_of_smotes[[i]][,"winback"])
+  tomek.smote.name <- paste("smote","tomek",i*2,sep="_")
+  list_tomek_smoted[[tomek.smote.name]] <- recipe(winback~.,list_of_smotes[[i]]) %>% step_tomek(winback) %>% prep() %>% bake(new_data = NULL)
+  #list_tomek_smoted[[i]][1:ncol(list_tomek_smoted[[i]])] <- lapply(list_tomek_smoted[[i]][1:ncol(list_tomek_smoted[[i]])], as.character)
+  list_tomek_smoted[[i]][factor_columns] <- lapply(list_tomek_smoted[[i]][factor_columns], factor,levels=c(0,1),labels = c("0","1"))
+  list_tomek_smoted[[i]][numeric_columns] <- lapply(list_tomek_smoted[[i]][numeric_columns], as.numeric)
+  
+}
+
+str(list_tomek_smoted[[1]])
+
+#Here we are going to split variables into training and testing samples, and independent and dependent variables.
+
+set.seed(500)
+
+train_indexes <- list()
+win_train_list_ind <- list()
+win_train_list_dep <- list()
+win_test_list_ind <- list()
+win_test_list_dep <- list()
+formula <- as.formula(winback ~ .+time_with_contract*.)
+
+
+
+for (i in 1:5) {
+  
+  train_tomek_smote <- paste("train","smote","tomek",i*2,sep="_")
+  test_tomek_smote <- paste("test","smote","tomek",i*2,sep="_")
+  list_tomek_smoted[[i]] <- list_tomek_smoted[[i]][,c(50,1:49)]
+  train_indexes[[i]] <- sample(1:nrow(list_tomek_smoted[[i]]), .75*nrow(list_tomek_smoted[[i]]))
+  win_train_list_ind[[train_tomek_smote]] <- model.matrix(formula,list_tomek_smoted[[i]][train_indexes[[i]],1:ncol(list_tomek_smoted[[i]])])[,-1]
+  win_test_list_ind[[test_tomek_smote]] <- model.matrix(formula,list_tomek_smoted[[i]][-train_indexes[[i]],1:ncol(list_tomek_smoted[[i]])])[,-1]
+  win_train_list_dep[[train_tomek_smote]] <- list_tomek_smoted[[i]][train_indexes[[i]],1]
+  win_test_list_dep[[test_tomek_smote]] <- list_tomek_smoted[[i]][-train_indexes[[i]],1]
+  win_train_list_ind[[i]] <- data.matrix(win_train_list_ind[[i]])
+  win_train_list_dep[[i]] <- win_train_list_dep[[i]]["winback"]
+  win_test_list_ind[[i]] <- data.matrix(win_test_list_ind[[i]])
+  win_test_list_dep[[i]] <- win_test_list_dep[[i]]["winback"]
+}
+
+
+
+#here we are going to start predicting
+
+list_of_fits <- list()
+
+
+for (x in 1:5) {
+  
+  name_df <- names(win_train_list_ind[x])
+  
+  for (i in 0:10) {
+    
+    fit.name <- paste(name_df,"win_alpha",i/10,sep="")
+    
+    list_of_fits[[name_df]][[fit.name]] <- cv.glmnet(win_train_list_ind[[x]],win_train_list_dep[[x]][[1]],type.measure = "deviance", 
+                                          alpha = i/10, nfolds = 5, family = "binomial")
+    
+  }
+  
+}
+
+
+results <- list()
+
+for (x in 1:5) {
+  
+  name_df <- names(win_train_list_ind[x])
+  results[name_df] <- as.data.frame(win_test_list_dep[[x]])
+
+  
+  for (i in 0:10) {
+    
+    fit.name <- paste(name_df,"win_alpha",i/10,sep="")
+
+    predicted <<- as.factor(round(predict(list_of_fits[[x]][[i+1]],
+                                         s=list_of_fits[[x]][[i+1]]$lambda.1se,
+                                         type="response",
+                                         newx = win_test_list_ind[[x]])))
+    predicted <- as.data.frame(predicted) 
+    names(predicted) <- fit.name
+    results[[x]] <- cbind(results[[x]],predicted)
+    names(results[[x]])[1] <- name_df
+    
+  }
+}
+
+
+
+#we have to retake from here
+
+sensitivities <- list()
+
+for (i in 1:5) {
+  
+  name_result <- names(results[i])
+  sensitivities_df <- as.data.frame(colnames(results[[i]][2:ncol(results[[i]])]))
+  names(sensitivities_df) <- "models"
+  sensitivities[[name_result]] <- sensitivities_df
+  
+}
+
+#cm_join_sens <- c()
+#cm_join_spe <- c()
+#cm_join_F1 <- c()
+
+cm_list_sens <- list()
+cm_list_spe <- list()
+cm_list_F1 <- list()
+
+
+for (x in 1:5) {
+  
+  cm_join_sens <- c()
+  cm_join_spe <- c()
+  cm_join_F1 <- c()
+  
+  for (i in 2:12) {
+  
+  cm <- confusionMatrix(results[[x]][[i]],results[[x]][[1]], mode = "everything",positive = "1")
+  cm_join_sens <- append(cm_join_sens,cm$byClass["Sensitivity"][[1]])
+  cm_join_spe <- append(cm_join_spe,cm$byClass["Specificity"][[1]])
+  cm_join_F1 <- append(cm_join_F1,cm$byClass["F1"][[1]])
+  
+  }
+  
+  name_result <- names(results[x])
+  cm_list_sens[[name_result]] <- as.data.frame(cm_join_sens)
+  cm_list_spe[[name_result]] <- as.data.frame(cm_join_spe)
+  cm_list_F1[[name_result]] <- as.data.frame(cm_join_F1)
+  
+}
+
+
+sensitivities_df <- list()
+
+for (i in 1:5) {
+  
+  name_result <- names(results[i])
+  sensitivities_df[[name_result]] <- cbind(sensitivities[[i]],cm_list_sens[[i]],cm_list_spe[[i]],cm_list_F1[[i]])
+  sensitivities_df[[i]] <- sensitivities_df[[i]] %>% arrange(desc(cm_join_sens))
+}
+
+
+all_results <- do.call(rbind,sensitivities_df) %>% arrange(desc(cm_join_sens))
+
+
+saveRDS(list_of_fits$train_smote_tomek_2$train_smote_tomek_2win_alpha0.3, "G:/SASData/Marketing/CRM/Github/Others/outputs/15smote_winback.rds")
